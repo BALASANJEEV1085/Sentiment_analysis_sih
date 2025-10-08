@@ -1,0 +1,12 @@
+streamlit==1.26.0
+pandas
+numpy
+scikit-learn
+nltk
+wordcloud
+matplotlib
+altair
+plotly
+python-dateutil
+openpyxl
+xlrd
