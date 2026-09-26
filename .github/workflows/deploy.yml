@@ -102,45 +102,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Resolve deployment image URI
-        run: |
-          set -euo pipefail
-          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
-          if [ -z "$IMAGE_URI" ]; then
-            IMAGE_URI="$ECR_REPOSITORY_URI:latest"
-          fi
-          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
-          echo "Deploying image: ${IMAGE_URI}"
-
       - name: Write SSM commands payload to JSON file
         run: |
+          set -euo pipefail
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "set -euo pipefail",
-              "export AWS_REGION=ap-south-1",
-              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "IMAGE_URI=${IMAGE_URI}",
-              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "export AWS_DEFAULT_REGION=ap-south-1",
+              "ECR_REGISTRY=\"$(echo \"$ECR_REPOSITORY_URI\" | cut -d'/' -f1)\"",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin \"$ECR_REGISTRY\"",
+              "docker pull \"$ECR_REPOSITORY_URI:${IMAGE_TAG}\"",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always --name app -p 80:8501 $IMAGE_URI",
+              "docker run -d --restart always --name app -p 80:8501 \"$ECR_REPOSITORY_URI:${IMAGE_TAG}\"",
               "docker ps --format '{{.Names}} {{.Status}}' | grep app || true",
               "docker image prune -f || true"
             ]
           }
           SSMPARAMS
-          envsubst_unused=1 || true
-          python - << 'PYEOF'
-          import os, json
-          with open('/tmp/ssm-params.json') as f:
-              payload = json.load(f)
-          payload["commands"] = [c.replace("${IMAGE_URI}", os.environ["IMAGE_URI"]) for c in payload["commands"]]
-          with open('/tmp/ssm-params.json', 'w') as f:
-              json.dump(payload, f, indent=2)
-          print("SSM payload written with IMAGE_URI baked in")
-          PYEOF
+          echo "--- ssm payload ---"
+          cat /tmp/ssm-params.json
 
       - name: Send SSM command to EC2 instance
         run: |
@@ -150,7 +132,8 @@ jobs:
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
+            --query "Command.CommandId" \
+            --output text)
           echo "COMMAND_ID=${COMMAND_ID}" >> "$GITHUB_ENV"
           echo "Sent SSM command: ${COMMAND_ID}"
 
@@ -167,13 +150,8 @@ jobs:
             --region "$AWS_REGION" \
             --query "Status" --output text)
           echo "SSM command status: ${STATUS}"
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "StandardOutputContent" --output text || true
           if [ "$STATUS" != "Success" ]; then
-            echo "SSM command failed with status ${STATUS}"
+            echo "--- stderr ---"
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$EC2_INSTANCE_ID" \
@@ -187,32 +165,30 @@ jobs:
     needs: deploy
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for container startup grace period
-        run: sleep 20
-
-      - name: Health check public URL (must return HTTP 200)
+      - name: Health check public URL (HTTP 200 required)
         run: |
           set -euo pipefail
-          HEALTH_URL="${PUBLIC_URL}${HEALTH_PATH}"
-          echo "Checking ${HEALTH_URL}"
-          for i in $(seq 1 15); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH_URL" || true)
-            echo "Attempt ${i}: HTTP ${CODE}"
+          URL="${PUBLIC_URL}${HEALTH_PATH}"
+          echo "Checking ${URL}"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "attempt ${i}: HTTP ${CODE}"
             if [ "$CODE" = "200" ]; then
-              echo "Health check passed (HTTP 200)"
+              echo "health check passed"
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed: never received HTTP 200 from ${HEALTH_URL}"
+          echo "health check failed: never received HTTP 200"
           exit 1
 
-      - name: Deployment summary
+      - name: Record deployment outputs
         run: |
           set -euo pipefail
-          echo "Deployment verified:"
-          echo "  public_url   = ${PUBLIC_URL}"
-          echo "  health_path  = ${HEALTH_PATH}"
-          echo "  instance_id  = ${EC2_INSTANCE_ID}"
-          echo "  ecr_repo     = ${ECR_REPOSITORY_URI}"
-          echo "  container    = ${CONTAINER_PORT} -> host ${HOST_PORT}"
+          echo "public_url=${PUBLIC_URL}"
+          echo "public_ip=43.204.71.54"
+          echo "instance_id=${EC2_INSTANCE_ID}"
+          echo "ecr_repo_url=${ECR_REPOSITORY_URI}"
+          echo "container_port=${CONTAINER_PORT}"
+          echo "host_port=${HOST_PORT}"
+          echo "deployment verified successfully"
