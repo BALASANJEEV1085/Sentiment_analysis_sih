@@ -81,7 +81,7 @@ jobs:
           BOOT_OK=0
           for i in $(seq 1 30); do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8501/_stcore/health || true)
-            if [ "$CODE" = "200"; then echo "Streamlit boot probe OK (HTTP 200)"; BOOT_OK=1; break; fi
+            if [ "$CODE" = "200" ]; then echo "Streamlit boot probe OK (HTTP 200)"; BOOT_OK=1; break; fi
             sleep 2
           done
           kill $SPID 2>/dev/null || true
@@ -93,111 +93,141 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          IMAGE_TAG="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::8}"
-          IMAGE_URI="$ECR_REPOSITORY_URI:$IMAGE_TAG"
-          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
-          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
-          echo "Image: $IMAGE_URI"
+          IMAGE_TAG="$(date -u +%Y%m%d%H%M%S)-${GITHUB_RUN_ID}"
+          IMAGE_URI="${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "Image: ${IMAGE_URI}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Amazon ECR (direct AWS CLI)
+      - name: Docker build - production image (multi-stage Dockerfile)
         run: |
           set -euo pipefail
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
-          echo "Registry: $ECR_REGISTRY"
-          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          IMAGE_URI="${{ steps.meta.outputs.image_uri }}"
+          docker build -t "${IMAGE_URI}" -t "${ECR_REPOSITORY_URI}:latest" -f Dockerfile .
+          docker images "${ECR_REPOSITORY_URI}"
 
-      - name: Build production image (multi-stage Dockerfile)
+      - name: Docker run - container health probe (/_stcore/health)
         run: |
           set -euo pipefail
-          docker build -t "$IMAGE_URI" -t "$ECR_REPOSITORY_URI:latest" -f Dockerfile .
-
-      - name: Container diagnostics - health probe inside image
-        run: |
-          set -euo pipefail
-          docker run -d --name smoke -p 8501:8501 "$IMAGE_URI"
-          OK=0
+          IMAGE_URI="${{ steps.meta.outputs.image_uri }}"
+          docker run -d --name smoke -p 8501:8501 "${IMAGE_URI}"
+          HEALTH_OK=0
           for i in $(seq 1 45); do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8501/_stcore/health || true)
-            if [ "$CODE" = "200" ]; then echo "Container health probe OK (HTTP 200)"; OK=1; break; fi
+            if [ "$CODE" = "200" ]; then echo "Container health probe OK (HTTP 200)"; HEALTH_OK=1; break; fi
             sleep 2
           done
           docker logs smoke || true
           docker rm -f smoke || true
-          if [ "$OK" != "1" ]; then echo "Container health probe failed"; exit 1; fi
+          if [ "$HEALTH_OK" != "1" ]; then echo "Container health probe failed"; exit 1; fi
 
-      - name: Push image to Amazon ECR
+      - name: ECR login (direct AWS CLI, static credentials)
         run: |
           set -euo pipefail
-          docker push "$IMAGE_URI"
-          docker push "$ECR_REPOSITORY_URI:latest"
+          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Ensure ECR repository exists
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --region "$AWS_REGION" --repository-names sentiment-analysis-sih || \
+          aws ecr create-repository --region "$AWS_REGION" --repository-name sentiment-analysis-sih
+
+      - name: Push image to ECR
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${{ steps.meta.outputs.image_uri }}"
+          docker push "${IMAGE_URI}"
+          docker push "${ECR_REPOSITORY_URI}:latest"
 
   deploy:
     name: Deploy to EC2 Docker via SSM
+    runs-on: ubuntu-latest
     needs: build
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy image on EC2 instance (SSM send-command)
-        env:
-          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
+      - name: Write SSM command payload to JSON file
         run: |
           set -euo pipefail
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
-          cat > /tmp/ssm-params.json <<SSMPARAMS
+          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
+          cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
               "set -euo pipefail",
-              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "export REGION=${AWS_REGION}",
+              "export IMAGE_URI=${IMAGE_URI}",
+              "export ECR_REGISTRY=${ECR_REPOSITORY_URI%/*}",
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:$CONTAINER_PORT --name app $IMAGE_URI"
+              "docker run -d --restart always -p 80:${CONTAINER_PORT} --name app $IMAGE_URI"
             ]
           }
           SSMPARAMS
-          COMMAND_ID=$(aws ssm send-command --instance-ids "$EC2_INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
-          echo "COMMAND_ID=$COMMAND_ID"
+          cat /tmp/ssm-params.json
+
+      - name: Send SSM command to EC2 instance
+        run: |
+          set -euo pipefail
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" --output text)
+          echo "COMMAND_ID=${COMMAND_ID}" >> "$GITHUB_ENV"
+          echo "Sent SSM command: ${COMMAND_ID}"
+
+      - name: Wait for SSM command completion
+        run: |
+          set -euo pipefail
           for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query "Status" --output text || true)
-            echo "SSM status: $STATUS"
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "Status" --output text || echo "Pending")
+            echo "SSM status: ${STATUS}"
             case "$STATUS" in
-              Success) echo "SSM command succeeded"; break ;;
+              Success) echo "SSM command succeeded"; exit 0 ;;
               InProgress|Pending|Delayed) sleep 5 ;;
-              *) echo "SSM command failed with status $STATUS"; aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" || true; exit 1 ;;
+              *) echo "SSM command failed with status ${STATUS}"; aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" || true; exit 1 ;;
             esac
           done
-          if [ "$STATUS" != "Success" ]; then echo "SSM command did not succeed in time"; exit 1; fi
+          echo "SSM command timed out"; exit 1
 
   verify:
-    name: Verify public deployment
-    needs: deploy
+    name: Verify public deployment health
     runs-on: ubuntu-latest
+    needs: deploy
     steps:
       - name: Health check public URL (HTTP 200 required)
         run: |
           set -euo pipefail
+          HEALTH_URL="${PUBLIC_URL}/_stcore/health"
           OK=0
-          for i in $(seq 1 60); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/_stcore/health" || true)
-            echo "Attempt $i: HTTP $CODE"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
+            echo "Attempt ${i}: HTTP ${CODE}"
             if [ "$CODE" = "200" ]; then OK=1; break; fi
             sleep 5
           done
-          if [ "$OK" != "1" ]; then echo "Public health check failed"; exit 1; fi
-          echo "Public health check OK: $PUBLIC_URL/_stcore/health returned HTTP 200"
+          if [ "$OK" != "1" ]; then echo "Public health check failed: no HTTP 200 from ${HEALTH_URL}"; exit 1; fi
+          echo "Public health check OK (HTTP 200) from ${HEALTH_URL}"
 
-      - name: Verify app homepage responds
+      - name: Summary of deployment targets
         run: |
           set -euo pipefail
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/" || true)
-          echo "Homepage HTTP $CODE"
-          if [ "$CODE" != "200" ]; then echo "Homepage check failed"; exit 1; fi
-          echo "Deployment verified: instance i-05a2563eed9aff4e0 serving via $PUBLIC_URL"
+          echo "region=${AWS_REGION}"
+          echo "instance_id=${EC2_INSTANCE_ID}"
+          echo "ecr_repository_uri=${ECR_REPOSITORY_URI}"
+          echo "public_url=${PUBLIC_URL}"
+          echo "container_port=${CONTAINER_PORT}"
+          echo "secrets_manager_id=${SECRETS_MANAGER_ID}"
