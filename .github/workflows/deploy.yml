@@ -81,7 +81,7 @@ jobs:
           BOOT_OK=0
           for i in $(seq 1 30); do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8501/_stcore/health || true)
-            if [ "$CODE" = "200" ]; then echo "Streamlit boot probe OK (HTTP 200)"; BOOT_OK=1; break; fi
+            if [ "$CODE" = "200"; then echo "Streamlit boot probe OK (HTTP 200)"; BOOT_OK=1; break; fi
             sleep 2
           done
           kill $SPID 2>/dev/null || true
@@ -93,51 +93,35 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          IMAGE_TAG="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::8}"
+          IMAGE_TAG="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::12}"
           IMAGE_URI="$ECR_REPOSITORY_URI:$IMAGE_TAG"
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_TAG=$IMAGE_TAG"
-          echo "IMAGE_URI=$IMAGE_URI"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+          echo "Image: $IMAGE_URI"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Docker login to ECR (direct AWS CLI, static credentials)
+      - name: Docker build sanity check (no push)
         run: |
           set -euo pipefail
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
-          aws ecr get-login-password --region "$AWS_REGION" | \
-            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker build -t sentiment-analysis-sih:ci .
 
-      - name: Build production image (multi-stage Dockerfile, context .)
+      - name: ECR login (direct AWS CLI, static credentials)
         run: |
           set -euo pipefail
-          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
-          docker build -f Dockerfile -t "$ECR_REPOSITORY_URI:$IMAGE_TAG" -t "$ECR_REPOSITORY_URI:latest" .
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REPOSITORY_URI"
 
-      - name: Local container health probe (port 8501)
+      - name: Push image to ECR (tag + latest)
         run: |
           set -euo pipefail
-          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
-          docker run -d --name local-probe -p 8501:8501 "$ECR_REPOSITORY_URI:$IMAGE_TAG"
-          OK=0
-          for i in $(seq 1 45); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8501/_stcore/health || true)
-            if [ "$CODE" = "200" ]; then echo "Local container probe OK (HTTP 200)"; OK=1; break; fi
-            sleep 2
-          done
-          docker logs local-probe || true
-          docker rm -f local-probe || true
-          if [ "$OK" != "1" ]; then echo "Local container probe failed"; exit 1; fi
-
-      - name: Push image to ECR
-        run: |
-          set -euo pipefail
-          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
+          docker tag sentiment-analysis-sih:ci "$ECR_REPOSITORY_URI:$IMAGE_TAG"
+          docker tag sentiment-analysis-sih:ci "$ECR_REPOSITORY_URI:latest"
           docker push "$ECR_REPOSITORY_URI:$IMAGE_TAG"
           docker push "$ECR_REPOSITORY_URI:latest"
-          echo "Pushed $ECR_REPOSITORY_URI:$IMAGE_TAG and :latest"
 
   deploy:
     name: Deploy to EC2 Docker via SSM
@@ -148,74 +132,90 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy image on EC2 via SSM send-command
+      - name: Write SSM commands payload to JSON file
         run: |
           set -euo pipefail
-          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
-          cat > /tmp/ssm-params.json <<SSMPARAMS
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "set -euo pipefail",
-              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "REGION=ap-south-1",
+              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/sentiment-analysis-sih:${{ needs.build.outputs.image_tag }}",
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always --name app -p 80:$CONTAINER_PORT $IMAGE_URI"
+              "docker run -d --restart always -p 80:8501 --name app $IMAGE_URI"
             ]
           }
           SSMPARAMS
+          cat /tmp/ssm-params.json
+
+      - name: Send SSM command to EC2 instance
+        run: |
+          set -euo pipefail
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
-          echo "COMMAND_ID=$COMMAND_ID"
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+          echo "Sent SSM command: $COMMAND_ID"
+
+      - name: Wait for SSM command completion
+        run: |
+          set -euo pipefail
           for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
+            STATUS=$(aws ssm list-command-invocations \
               --command-id "$COMMAND_ID" \
               --instance-id "$EC2_INSTANCE_ID" \
               --region "$AWS_REGION" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
+              --query "CommandInvocations[0].Status" --output text)
             echo "SSM status: $STATUS"
             case "$STATUS" in
-              Success) echo "SSM deploy command succeeded"; break ;;
-              InProgress|Pending|Delayed) sleep 5 ;;
-              *) echo "SSM deploy command failed with status $STATUS"; exit 1 ;;
+              Success) echo "SSM command succeeded"; exit 0 ;;
+              Failed|Cancelled|TimedOut) echo "SSM command failed with status $STATUS"; exit 1 ;;
             esac
+            sleep 10
           done
-          if [ "$STATUS" != "Success" ]; then echo "SSM command did not succeed in time"; exit 1; fi
+          echo "Timed out waiting for SSM command"; exit 1
 
-      - name: Record deployment metadata
+      - name: Show SSM command output
+        if: always()
         run: |
-          set -euo pipefail
-          echo "instance_id=$EC2_INSTANCE_ID"
-          echo "ecr_repo_url=$ECR_REPOSITORY_URI"
-          echo "image_uri=${{ needs.build.outputs.image_uri }}"
-          echo "public_url=$PUBLIC_URL"
-          echo "security_group_id=sg-092b9d07aec65891d"
-          echo "iam_instance_profile=sentiment-analysis-sih-instance-profile"
-          echo "iam_role=sentiment-analysis-sih-ec2-role"
-          echo "secrets_manager_id=$SECRETS_MANAGER_ID"
+          aws ssm list-command-invocations \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --details \
+            --query "CommandInvocations[0].CommandPlugins[0].{Status:Status,Output:Output}" \
+            --output text || true
 
   verify:
-    name: Verify public endpoint health
+    name: Verify public health endpoint
     needs: deploy
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for container startup on EC2
+      - name: Wait for container startup grace period
         run: sleep 20
 
       - name: Health check public URL (HTTP 200 required)
         run: |
           set -euo pipefail
+          HEALTH_URL="$PUBLIC_URL/_stcore/health"
           OK=0
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/" || true)
-            echo "Attempt $i: HTTP $CODE"
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
+            echo "Attempt $i: HTTP $CODE from $HEALTH_URL"
             if [ "$CODE" = "200" ]; then OK=1; break; fi
             sleep 5
           done
-          if [ "$OK" != "1" ]; then echo "Public health check failed: expected HTTP 200 from $PUBLIC_URL"; exit 1; fi
-          echo "Public health check passed (HTTP 200) at $PUBLIC_URL"
+          if [ "$OK" != "1" ]; then
+            echo "Verification failed: $HEALTH_URL did not return HTTP 200"
+            exit 1
+          fi
+          BODY=$(curl -s "$HEALTH_URL" || true)
+          echo "Health body: $BODY"
+          echo "VERIFIED: $PUBLIC_URL is serving HTTP 200 on /_stcore/health (port $CONTAINER_PORT)"
