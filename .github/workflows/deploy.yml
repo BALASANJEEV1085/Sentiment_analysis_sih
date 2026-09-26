@@ -102,18 +102,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Resolve deployment image URI
-        run: |
-          set -euo pipefail
-          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
-          if [ -z "$IMAGE_URI" ]; then
-            IMAGE_URI="$ECR_REPOSITORY_URI:latest"
-          fi
-          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
-          ECR_REGISTRY="$(echo "$ECR_REPOSITORY_URI" | cut -d'/' -f1)"
-          echo "ECR_REGISTRY=${ECR_REGISTRY}" >> "$GITHUB_ENV"
-          echo "Deploying image: ${IMAGE_URI}"
-
       - name: Write SSM commands payload to JSON file
         run: |
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
@@ -121,45 +109,26 @@ jobs:
             "commands": [
               "set -euo pipefail",
               "export AWS_DEFAULT_REGION=ap-south-1",
-              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/sentiment-analysis-sih:${IMAGE_TAG}",
+              "ECR_REGISTRY=$(echo 759204735992.dkr.ecr.ap-south-1.amazonaws.com/sentiment-analysis-sih | cut -d'/' -f1)",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "IMAGE_URI=${{ needs.build.outputs.image_uri }}",
+              "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:8501 --name app 759204735992.dkr.ecr.ap-south-1.amazonaws.com/sentiment-analysis-sih:${IMAGE_TAG}",
-              "docker ps --format '{{.Names}} {{.Status}}' | grep app || true",
-              "docker image prune -f || true"
+              "docker run -d --restart always -p 80:8501 --name app $IMAGE_URI",
+              "docker ps --format '{{.Names}} {{.Status}}' | grep app || true"
             ]
           }
           SSMPARAMS
-          echo "--- ssm payload ---"
-          cat /tmp/ssm-params.json
 
       - name: Send SSM command to EC2 instance
         run: |
           set -euo pipefail
-          export IMAGE_TAG="${{ needs.build.outputs.image_tag }}"
-          envsubst < /tmp/ssm-params.json > /tmp/ssm-params-resolved.json || true
-          if [ -s /tmp/ssm-params-resolved.json ] && grep -q "${IMAGE_TAG}" /tmp/ssm-params-resolved.json; then
-            PARAMS_FILE=/tmp/ssm-params-resolved.json
-          else
-            python3 - "$IMAGE_TAG" << 'PYEOF'
-          import json, os
-          tag = os.environ.get("IMAGE_TAG", "") or "latest"
-          with open("/tmp/ssm-params.json") as f:
-              data = json.load(f)
-          data["commands"] = [c.replace("${IMAGE_TAG}", tag) for c in data["commands"]]
-          with open("/tmp/ssm-params-resolved.json", "w") as f:
-              json.dump(data, f, indent=2)
-          PYEOF
-            PARAMS_FILE=/tmp/ssm-params-resolved.json
-          fi
-          echo "--- resolved payload ---"
-          cat "$PARAMS_FILE"
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
-            --parameters file://$PARAMS_FILE \
+            --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
           echo "COMMAND_ID=${COMMAND_ID}" >> "$GITHUB_ENV"
           echo "Sent SSM command: ${COMMAND_ID}"
@@ -167,74 +136,42 @@ jobs:
       - name: Wait for SSM command completion
         run: |
           set -euo pipefail
-          DEADLINE=$(( $(date +%s) + 600 ))
-          while true; do
-            STATUS=$(aws ssm list-command-invocations \
-              --instance-id "$EC2_INSTANCE_ID" \
-              --command-id "$COMMAND_ID" \
-              --query "CommandInvocations[0].Status" --output text)
-            echo "SSM status: ${STATUS}"
-            case "$STATUS" in
-              Success) echo "SSM command succeeded"; break ;;
-              Failed|Cancelled|TimedOut) echo "SSM command failed with status ${STATUS}"; exit 1 ;;
-            esac
-            if [ "$(date +%s)" -gt "$DEADLINE" ]; then
-              echo "Timed out waiting for SSM command"; exit 1
-            fi
-            sleep 15
-          done
-
-      - name: Show SSM command output (deployment log)
-        if: always()
-        run: |
-          set -euo pipefail
-          aws ssm get-command-invocation \
-            --instance-id "$EC2_INSTANCE_ID" \
+          aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
-            --query "{Status:Status,StdOut:StandardOutputContent,StdErr:StandardErrorContent}" \
-            --output json || true
+            --instance-id "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION"
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "Status" --output text)
+          echo "SSM command status: ${STATUS}"
+          if [ "$STATUS" != "Success" ]; then
+            echo "--- stdout ---"
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query "StandardOutputContent" --output text || true
+            echo "--- stderr ---"
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query "StandardErrorContent" --output text || true
+            exit 1
+          fi
 
   verify:
     name: Verify Public Health Endpoint
-    needs: deploy
+    needs: [build, deploy]
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for container startup
-        run: |
-          set -euo pipefail
-          echo "Giving Streamlit container time to boot..."
-          sleep 30
-
       - name: Health check public URL (HTTP 200 required)
         run: |
           set -euo pipefail
-          HEALTH_URL="${PUBLIC_URL}${HEALTH_PATH}"
-          echo "Probing ${HEALTH_URL}"
-          ATTEMPTS=10
-          for i in $(seq 1 $ATTEMPTS); do
-            CODE=$(curl -s -o /tmp/health_body -w '%{http_code}' "$HEALTH_URL" || true)
-            echo "Attempt ${i}/${ATTEMPTS}: HTTP ${CODE}"
+          URL="${PUBLIC_URL}${HEALTH_PATH}"
+          echo "Checking ${URL}"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || true)
+            echo "attempt ${i}: HTTP ${CODE}"
             if [ "$CODE" = "200" ]; then
-              echo "--- body ---"
-              cat /tmp/health_body || true
-              echo "HEALTH CHECK PASSED: HTTP 200 from ${HEALTH_URL}"
+              echo "health check passed"
               exit 0
             fi
-            sleep 15
+            sleep 10
           done
-          echo "HEALTH CHECK FAILED: no HTTP 200 from ${HEALTH_URL} after ${ATTEMPTS} attempts"
+          echo "health check failed: never received HTTP 200"
           exit 1
-
-      - name: Deployment summary
-        run: |
-          set -euo pipefail
-          {
-            echo "## Deployment Summary"
-            echo "- Service: EC2_DOCKER (Streamlit sentiment analysis app)"
-            echo "- Region: $AWS_REGION"
-            echo "- ECR repo: $ECR_REPOSITORY_URI"
-            echo "- Instance: $EC2_INSTANCE_ID"
-            echo "- Container port: $CONTAINER_PORT, host port: $HOST_PORT"
-            echo "- Public URL: $PUBLIC_URL"
-            echo "- Status: verified healthy (HTTP 200)"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
