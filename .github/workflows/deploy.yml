@@ -1,0 +1,259 @@
+name: build-deploy-verify-sentiment-analysis
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/sentiment-analysis-sih
+  EC2_INSTANCE_ID: i-05a2563eed9aff4e0
+  PUBLIC_URL: http://43.204.71.54
+  CONTAINER_PORT: "8501"
+  SECRETS_MANAGER_ID: deptic/Sentiment_analysis_sih/secrets
+
+jobs:
+  build:
+    name: Build, Diagnostics and Push Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies from requirements.txt
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build diagnostics - compile all Python sources
+        run: |
+          set -euo pipefail
+          python -m py_compile app.py src/data_loader.py src/preprocessor.py src/trainer.py src/visuals.py
+          python -m compileall -q app.py src
+          ls -la app.py requirements.txt models/sentiment_model.pkl src/
+
+      - name: Build diagnostics - import smoke test (modules only)
+        run: |
+          set -euo pipefail
+          python - <<'PYEOF'
+          import importlib
+          for mod in ("src.data_loader", "src.preprocessor", "src.trainer", "src.visuals"):
+              importlib.import_module(mod)
+              print("OK import", mod)
+          from src.trainer import vader_sentiment_label, vader_sentiment_score
+          print("VADER score:", vader_sentiment_score("I love this product"))
+          print("VADER label:", vader_sentiment_label("this is terrible"))
+          PYEOF
+
+      - name: Build diagnostics - model artifact load check
+        run: |
+          set -euo pipefail
+          python - <<'PYEOF'
+          import pickle
+          with open("models/sentiment_model.pkl", "rb") as f:
+              pipe = pickle.load(f)
+          print("Model loaded:", type(pipe))
+          print("Steps:", [name for name, _ in pipe.steps])
+          preds = pipe.predict(["I love it", "I hate it", "it is okay"])
+          print("Sample predictions:", list(preds))
+          PYEOF
+
+      - name: Build diagnostics - streamlit headless boot probe
+        run: |
+          set -euo pipefail
+          timeout 60 streamlit run app.py --server.headless true --server.port 8501 --server.address 127.0.0.1 &
+          SPID=$!
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8501/_stcore/health || true)
+            if [ "$CODE" = "200" ]; then echo "Streamlit boot probe OK (HTTP 200)"; break; fi
+            sleep 2
+          done
+          kill $SPID 2>/dev/null || true
+          wait $SPID 2>/dev/null || true
+          echo "Boot probe finished"
+
+      - name: Create Dockerfile (repo has none - Streamlit on port 8501)
+        run: |
+          set -euo pipefail
+          cat > Dockerfile <<'DOCKERFILE'
+          FROM python:3.10-slim
+          WORKDIR /app
+          ENV PYTHONUNBUFFERED=1 \
+              PIP_NO_CACHE_DIR=1 \
+              NLTK_DATA=/usr/local/share/nltk_data
+          RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+          COPY requirements.txt .
+          RUN pip install --no-cache-dir -r requirements.txt
+          RUN python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('stopwords', quiet=True); nltk.download('vader_lexicon', quiet=True)"
+          COPY . .
+          EXPOSE 8501
+          HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+            CMD curl -fsS http://localhost:8501/_stcore/health || exit 1
+          CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+          DOCKERFILE
+          echo "--- Dockerfile ---"
+          cat Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tag and URI
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          TAG="${GITHUB_RUN_ID}-${SHORT_SHA}"
+          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
+          FULL_IMAGE="$ECR_REPOSITORY_URI:$TAG"
+          LATEST_IMAGE="$ECR_REPOSITORY_URI:latest"
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_ENV"
+          echo "LATEST_IMAGE=$LATEST_IMAGE" >> "$GITHUB_ENV"
+          echo "Registry: $ECR_REGISTRY"
+          echo "Image: $FULL_IMAGE"
+
+      - name: Docker CLI login to ECR (static credentials)
+        run: |
+          set -euo pipefail
+          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Build and push image to ECR
+        run: |
+          set -euo pipefail
+          docker build -t "$FULL_IMAGE" -t "$LATEST_IMAGE" .
+          docker push "$FULL_IMAGE"
+          docker push "$LATEST_IMAGE"
+          docker images "$ECR_REPOSITORY_URI"
+
+  deploy:
+    name: Deploy to EC2 via SSM
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve deployment parameters from Secrets Manager
+        run: |
+          set -euo pipefail
+          echo "Resolving secrets from: $SECRETS_MANAGER_ID"
+          aws secretsmanager get-secret-value \
+            --secret-id "$SECRETS_MANAGER_ID" \
+            --region "$AWS_REGION" \
+            --query SecretString --output text > /tmp/deploy-secrets.json || true
+          if [ -s /tmp/deploy-secrets.json ]; then
+            echo "Secret document retrieved (values masked for logs)."
+          else
+            echo "No secret document returned; using workflow environment defaults."
+          fi
+
+      - name: Write SSM command payload to JSON file
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          {
+            "commands": [
+              "set -euo pipefail",
+              "REGION=ap-south-1",
+              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/sentiment-analysis-sih:IMAGE_TAG_PLACEHOLDER",
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always -p 80:8501 --name app $IMAGE_URI",
+              "docker ps --filter name=app"
+            ]
+          }
+          SSMPARAMS
+          sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ needs.build.outputs.image_tag }}|" /tmp/ssm-params.json
+          echo "--- SSM payload ---"
+          cat /tmp/ssm-params.json
+
+      - name: Send deployment command via SSM
+        run: |
+          set -euo pipefail
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" --output text)
+          echo "COMMAND_ID=$COMMAND_ID"
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+
+      - name: Wait for SSM command completion
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "Status" --output text || echo "Pending")
+            echo "Attempt $i: status=$STATUS"
+            case "$STATUS" in
+              Success) echo "SSM command succeeded"; exit 0 ;;
+              InProgress|Pending|Delayed) sleep 10 ;;
+              *) echo "SSM command failed with status $STATUS"
+                 aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" || true
+                 exit 1 ;;
+            esac
+          done
+          echo "Timed out waiting for SSM command"
+          exit 1
+
+  verify:
+    name: Verify public health endpoint
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Streamlit container to become healthy
+        run: |
+          set -euo pipefail
+          echo "Polling $PUBLIC_URL/_stcore/health and $PUBLIC_URL ..."
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/_stcore/health" || true)
+            if [ "$CODE" = "200" ]; then
+              echo "Health endpoint returned HTTP 200 on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $CODE - retrying in 10s"
+            sleep 10
+          done
+          echo "Health check never returned HTTP 200"
+          exit 1
+
+      - name: Final health check - root URL must be HTTP 200
+        run: |
+          set -euo pipefail
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/")
+          echo "Root URL HTTP status: $CODE"
+          if [ "$CODE" != "200" ]; then
+            echo "FINAL HEALTH CHECK FAILED: expected 200, got $CODE"
+            exit 1
+          fi
+          echo "Deployment verified: $PUBLIC_URL is serving the Streamlit app (HTTP 200)."
+          echo "instance_id=$EC2_INSTANCE_ID"
+          echo "ecr_repo_url=$ECR_REPOSITORY_URI"
+          echo "image=${{ needs.build.outputs.image_uri }}"
